@@ -151,10 +151,16 @@ int main(int nargs, char *argv[])
         std::cout << "Press up cursor to double the time step" << std::endl;
 
         // initializing variable to hold keyboard's commands
-        char key = 'R';
+        char key = '_';
         auto start = std::chrono::system_clock::now();
         int frames = 0;
         int fps = 0;
+
+        // myScreen.clear(sf::Color::Black);
+        // myScreen.displayVelocityField(grid, vortices);
+        // myScreen.displayParticles(grid, vortices, cloud);
+        // myScreen.display();
+
         while (myScreen.isOpen())
         {
             // on inspecte tous les évènements de la fenêtre qui ont été émis depuis la précédente itération
@@ -206,27 +212,27 @@ int main(int nargs, char *argv[])
                 MPI_Irecv(grid.data(), 2 * grid.get_size_velocity_field(), MPI_DOUBLE, 1, 2, MPI_COMM_WORLD, &request);
                 MPI_Irecv(vortices.data(), 3 * vortices.numberOfVortices(), MPI_DOUBLE, 1, 3, MPI_COMM_WORLD, &request);
                 frames++;
-
-                // updating screen
-                myScreen.clear(sf::Color::Black);
-
-                std::string strDt = std::string("Time step : ") + std::to_string(dt);
-                myScreen.drawText(strDt, Geometry::Point<double>{50, double(myScreen.getGeometry().second - 96)});
-                myScreen.displayVelocityField(grid, vortices);
-                myScreen.displayParticles(grid, vortices, cloud);
-
-                auto end = std::chrono::system_clock::now();
-                std::chrono::duration<double> diff = end - start;
-                if (diff.count() >= 1.0)
-                {
-                    fps = frames;
-                    start = end;
-                    frames = 0;
-                }
-                std::string str_fps = std::string("FPS : ") + std::to_string(fps);
-                myScreen.drawText(str_fps, Geometry::Point<double>{300, double(myScreen.getGeometry().second - 96)});
-                myScreen.display();
             }
+
+            // updating screen
+            myScreen.clear(sf::Color::Black);
+
+            std::string strDt = std::string("Time step : ") + std::to_string(dt);
+            myScreen.drawText(strDt, Geometry::Point<double>{50, double(myScreen.getGeometry().second - 96)});
+            myScreen.displayVelocityField(grid, vortices);
+            myScreen.displayParticles(grid, vortices, cloud);
+
+            auto end = std::chrono::system_clock::now();
+            std::chrono::duration<double> diff = end - start;
+            if (diff.count() >= 1.0)
+            {
+                fps = frames;
+                start = end;
+                frames = 0;
+            }
+            std::string str_fps = std::string("FPS : ") + std::to_string(fps);
+            myScreen.drawText(str_fps, Geometry::Point<double>{300, double(myScreen.getGeometry().second - 96)});
+            myScreen.display();
         }
     }
 
@@ -248,7 +254,6 @@ int main(int nargs, char *argv[])
                 { // terminate processes
                     MPI_Finalize();
                     return EXIT_SUCCESS;
-                    break;
                 }
                 case 'P': // play
                     animate = true;
