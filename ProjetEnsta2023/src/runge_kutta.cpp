@@ -12,11 +12,13 @@ Numeric::solve_RK4_fixed_vortices(double dt, CartesianGridOfSpeed const &t_veloc
     using point = Simulation::Vortices::point;
 
     Geometry::CloudOfPoints newCloud(t_points.numberOfPoints());
-    // On ne bouge que les points :
 
     std::size_t begin = myrank * t_points.numberOfPoints() / nranks;
     std::size_t end = (myrank + 1) * t_points.numberOfPoints() / nranks;
-    // #pragma omp parallel for
+
+    if (myrank == nranks - 1)
+        end = t_points.numberOfPoints();
+#pragma omp parallel for
     for (std::size_t iPoint = begin; iPoint < end; iPoint++)
     {
         point p = t_points[iPoint];
@@ -48,9 +50,13 @@ Numeric::solve_RK4_movable_vortices(double dt, CartesianGridOfSpeed &t_velocity,
     // On ne bouge que les points :
     std::size_t begin = myrank * t_points.numberOfPoints() / nranks;
     std::size_t end = (myrank + 1) * t_points.numberOfPoints() / nranks;
-    std::cout << myrank << " - " << end - begin << std::endl;
 
-    // #pragma omp parallel for
+    if (myrank == nranks - 1)
+        end = t_points.numberOfPoints();
+
+    std::cout << "rank: " << myrank + 1 << " begin: " << begin << " end: " << end << std::endl;
+
+#pragma omp parallel for
     for (std::size_t iPoint = begin; iPoint < end; ++iPoint)
     {
         point p = t_points[iPoint];

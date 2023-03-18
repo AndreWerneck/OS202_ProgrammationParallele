@@ -102,31 +102,49 @@ auto readConfigFile(std::ifstream &input)
     return std::make_tuple(vortices, isMobile, cartesianGrid, cloudOfPoints);
 }
 
+/* Function qui calcule la quantité de points envoyée par chaque processus pour le processus 0
+Pour faire la communication en utilisant MPI_Gatherv
+
+Par exemple, le recvcount[2] répresent la quantité de données envoyée par le processus 2
+pour le processus 0
+
+Comme on se trouve dans un cas où le processus 0 ne fait que recevoir le message,
+le recvcount[0] est evidemment égal à 0
+*/
 void calcRecvcount(int *recvcounts, int numberOfPoints, int nranks)
 {
     recvcounts[0] = 0;
-    int sum = 2 * numberOfPoints / (nranks - 1);
     for (int i = 1; i < nranks; i++)
     {
-        recvcounts[i] = sum;
+        int myrank = i - 1;
+        int begin = myrank * numberOfPoints / (nranks - 1);
+        int end = (myrank + 1) * numberOfPoints / (nranks - 1);
+
+        if (myrank == nranks - 1)
+            end = numberOfPoints;
+
+        int sum = end - begin;
+
+        recvcounts[i] = 2 * sum;
     }
 }
 
-void calcDispls(int *displs, int numberOfPoints, int nranks)
+/* Calc displacements pour la communication MPI_Gatherv*/
+void calcDispls(int *displs, int *recvcounts, int numberOfPoints, int nranks)
 {
     displs[0] = 0;
     displs[1] = 0;
-    int sum = 2 * numberOfPoints / (nranks - 1);
     for (int i = 2; i < nranks; i++)
     {
-        displs[i] = displs[i - 1] + sum;
+        displs[i] = displs[i - 1] + recvcounts[i - 1];
     }
 }
 
 int main(int nargs, char *argv[])
 {
 
-    // number of process and process number
+    // n_ranks: répresent le nombre de processus et
+    // my_rank répresent le nombre du processus courant
     int n_ranks, my_rank;
 
     // initializing MPI
@@ -163,15 +181,16 @@ int main(int nargs, char *argv[])
 
     grid.updateVelocityField(vortices);
 
-    bool animate = true;
+    bool animate = false;
 
     double dt = 0.1; // velocity
 
-    MPI_Status status; // mpi_status for MPI_Iprobe
-    MPI_Request request;
-    int flag = 0;           // flag to use if there is any message to receive
-    int terminate_flag = 0; // flag to use only if want to terminate processes
+    MPI_Status status; // MPI Status variable
 
+    int flag = 0; // Flag to use if there is any message to receive
+
+    /* Ici on divide le processus 0 des autres processus >= 1*/
+    /* Le processus 0 est résponsable pour l'affichage d'écran et pour capter les 'inputs' d'user*/
     if (my_rank == 0)
     {
         // screen info
@@ -189,8 +208,10 @@ int main(int nargs, char *argv[])
         auto start = std::chrono::system_clock::now();
         int frames = 0;
         int fps = 0;
-        int countExited = 0;
 
+        /* Calcule de recvcounts et displacements qui seront utiliser par le processus 0,
+            pour recevoir des données en utilisant le MPI_Gatherv
+        */
         int cloudRecvcounts[n_ranks];
         int gridRecvcounts[n_ranks];
         int cloudDispls[n_ranks];
@@ -198,27 +219,37 @@ int main(int nargs, char *argv[])
 
         calcRecvcount(cloudRecvcounts, cloud.numberOfPoints(), n_ranks);
         calcRecvcount(gridRecvcounts, grid.numberOfPoints(), n_ranks);
-        calcDispls(cloudDispls, cloud.numberOfPoints(), n_ranks);
-        calcDispls(gridDispls, grid.numberOfPoints(), n_ranks);
+        calcDispls(cloudDispls, cloudRecvcounts, cloud.numberOfPoints(), n_ranks);
+        calcDispls(gridDispls, gridRecvcounts, grid.numberOfPoints(), n_ranks);
 
-        auto timeoutFinalize = std::chrono::system_clock::now();
+        auto action_exit_time = std::chrono::system_clock::now();
+        float wait_comm_time = n_ranks * 0.05;
         while (myScreen.isOpen())
         {
+            /* Vérifie qu'il y a de données a recevoir*/
             MPI_Iprobe(1, TAG_DATA, MPI_COMM_WORLD, &flag, &status);
             if (flag)
             {
+                /* Le nombre de vortices n'est pas parallélisé entre les processus,
+                seulement le processus 1 est résponsable pour envoyer les données de vortices
+                C'est pour ça qu'ici on utilise MPI_Recv au lieu de Gatherv
+                */
                 MPI_Recv(vortices.data(), vortices.numberOfVortices() * 3, MPI_DOUBLE, 1, TAG_DATA, MPI_COMM_WORLD, &status);
 
+                /*
+                Ici, on utilise Gatherv pour recevoir les données qui seront envoyées par les autres processus
+                2 Gatherv sont faits, un pour recevoir le cloud data (qui répresente les positions des particules)
+                et l'autre pour recevoir le grid data (qui répresent les vectors vitesse de chaque particule)
+                */
                 MPI_Gatherv(NULL, 0, MPI_DOUBLE, cloud.data(), cloudRecvcounts, cloudDispls, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
                 MPI_Gatherv(NULL, 0, MPI_DOUBLE, grid.data(), gridRecvcounts, gridDispls, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            }
 
-            if (flag)
-            {
+                /* Pour chaque fois qu'on reçois des données, on increment les nombres de frames
+                Lorsque une seconde se passe, les frames sont affiché dans l'écran et est reseté
+                */
                 frames++;
 
-                // updating screen
+                // Code suivant pour mettre a jour l'affichage d'écran avec des nouvelles données
                 myScreen.clear(sf::Color::Black);
 
                 std::string strDt = std::string("Time step : ") + std::to_string(dt);
@@ -226,6 +257,9 @@ int main(int nargs, char *argv[])
                 myScreen.displayVelocityField(grid, vortices);
                 myScreen.displayParticles(grid, vortices, cloud);
 
+                /*
+                    Affichage de FPS dans l'écran
+                */
                 auto end = std::chrono::system_clock::now();
                 std::chrono::duration<double> diff = end - start;
                 if (diff.count() >= 1.0)
@@ -241,10 +275,12 @@ int main(int nargs, char *argv[])
 
             // on inspecte tous les évènements de la fenêtre qui ont été émis depuis la précédente itération
             sf::Event event;
-            // while inspecting screen and the command is not T (terminate other processes) or X (terminate this process)
+
+            /* Ici, on prend l'action d'user et on envoi au process*/
             while (myScreen.pollEvent(event) && action != ACTION_EXIT)
             {
                 // event resize screen
+                action = NO_ACTION;
                 if (event.type == sf::Event::Resized)
                     myScreen.resize(event);
                 // event play animation
@@ -264,92 +300,103 @@ int main(int nargs, char *argv[])
                     action = ACTION_STEP;
                 // event close window and terminate other processes
                 if (event.type == sf::Event::Closed)
-                    action = ACTION_EXIT;
-                // if a key is pressed, send this key to process 1
-                if (action != NO_ACTION)
                 {
+                    action = ACTION_EXIT;
+                    action_exit_time = std::chrono::system_clock::now();
+                }
+
+                // Broadcast pour tous les autres processus de l'action d'user
+                if (action != NO_ACTION)
                     for (int i = 1; i < n_ranks; i++)
                         MPI_Send(&action, 1, MPI_CHAR, i, TAG_USER_ACTION, MPI_COMM_WORLD);
-                }
-                if (action == ACTION_EXIT)
-                    timeoutFinalize = std::chrono::system_clock::now();
             }
 
-            auto now = std::chrono::system_clock::now();
-            std::chrono::duration<double> diff = now - timeoutFinalize;
-            if (action == ACTION_EXIT && diff.count() > (0.05 * n_ranks))
+            /*
+                Si action est une action de sortie, le processus après avoir envoyé l'action de sortie
+                à tous les autres processus, va attendre une certain temps pour recevoir encore les informations manquants,
+                pour ne pas risquer d'avoir l'effet de deadlock. Après ce certain temps défini, il sort et finalise le processus
+            */
+            if (action == ACTION_EXIT)
             {
-                myScreen.close();
+                std::chrono::duration<double> diff = std::chrono::system_clock::now() - action_exit_time;
+                if (diff.count() > wait_comm_time)
+                    myScreen.close();
             }
         }
     }
+
+    /* Pour tous les processus différents de 0*/
     else
     {
         char action = NO_ACTION;
+
+        /*
+            Les variables ci-dessous sont utilisés pour faire la partie Send du Gatherv
+            Les variables cloudPos et gridPos répresent la position dans la mémoire du "buffer"
+            de donnés qui seront envoyés par chaque procesus
+        */
+        auto cloudNumberOfPoints = cloud.numberOfPoints() / (n_ranks - 1);
+        auto gridNumberOfPoints = grid.numberOfPoints() / (n_ranks - 1);
+        auto cloudPos = (2 * cloudNumberOfPoints) * (my_rank - 1);
+        auto gridPos = (2 * gridNumberOfPoints) * (my_rank - 1);
+
         while (action != ACTION_EXIT)
         {
             bool advance = false;
-            // checking if process 0 has sent messages
+            // Vérification s'il y a d'actions d'user à recevoir (qui on été envoyés par le processus 0)
             MPI_Iprobe(0, TAG_USER_ACTION, MPI_COMM_WORLD, &flag, &status);
             if (flag)
             {
-                // reading keyboard pressed
+                // Lecture de l'action d'user en utilisant MPI_Recv
                 MPI_Recv(&action, 1, MPI_CHAR, 0, TAG_USER_ACTION, MPI_COMM_WORLD, &status);
                 switch (action)
                 {
-                case ACTION_EXIT:
-                    break;
-                case ACTION_PLAY: // play
+                case ACTION_PLAY:
                     animate = true;
                     break;
-                case ACTION_STOP: // stop
+                case ACTION_STOP:
                     animate = false;
                     break;
-                case ACTION_DOUBLE: //+speed
+                case ACTION_DOUBLE: // double speed
                     dt *= 2;
                     break;
-                case ACTION_HALF: //-speed
+                case ACTION_HALF: // half speed
                     dt /= 2;
                     break;
-                case ACTION_STEP: // advance
+                case ACTION_STEP: // advance step
                     advance = true;
+                    break;
+                case ACTION_EXIT:
                     break;
                 default:
                     break;
                 }
             }
 
-            // if not stopped, calculate
             if (action != ACTION_EXIT && (animate | advance))
             {
+                /*
+                    Calcul Runge-Kutta
+                */
                 if (isMobile)
-                {
                     cloud = Numeric::solve_RK4_movable_vortices(dt, grid, vortices, cloud, my_rank - 1, n_ranks - 1);
-                }
                 else
-                {
                     cloud = Numeric::solve_RK4_fixed_vortices(dt, grid, cloud, my_rank - 1, n_ranks - 1);
-                }
-
-                // sending data to 0 (affichage)
-                // multiply *2 because Geometry::Vector<double> espected in grid is 2D
-                if (my_rank == 1)
-                    MPI_Send(vortices.data(), vortices.numberOfVortices() * 3, MPI_DOUBLE, 0, TAG_DATA, MPI_COMM_WORLD);
 
                 auto cloudData = cloud.data();
-                auto cloudNumberOfPoints = cloud.numberOfPoints() / (n_ranks - 1);
-                auto cloudPos = (2 * cloudNumberOfPoints) * (my_rank - 1);
-                MPI_Gatherv(&cloudData[cloudPos], 2 * cloudNumberOfPoints, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
                 auto gridData = grid.data();
-                auto gridNumberOfPoints = grid.numberOfPoints() / (n_ranks - 1);
-                auto gridPos = (2 * gridNumberOfPoints) * (my_rank - 1);
+
+                /*
+                    Envoie des donnés pour le processus 0
+                */
+                if (my_rank == 1)
+                    MPI_Send(vortices.data(), 3 * vortices.numberOfVortices(), MPI_DOUBLE, 0, TAG_DATA, MPI_COMM_WORLD);
+                MPI_Gatherv(&cloudData[cloudPos], 2 * cloudNumberOfPoints, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
                 MPI_Gatherv(&gridData[gridPos], 2 * gridNumberOfPoints, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
             }
         }
     }
 
-    std::cout << "finalizando " << my_rank << std::endl;
     MPI_Finalize();
     return 0;
 }
