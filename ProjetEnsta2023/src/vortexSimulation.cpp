@@ -14,6 +14,18 @@
 #include "screen.hpp"
 #include <mpi.h>
 
+#define ACTION_STEP 'R'
+#define ACTION_DOUBLE 'U'
+#define ACTION_HALF 'D'
+#define ACTION_PLAY 'P'
+#define ACTION_STOP 'S'
+#define NO_ACTION '_'
+#define ACTION_EXIT 'X'
+
+#define TAG_USER_ACTION 0
+#define TAG_DATA 1
+#define TAG_EXIT 99
+
 // prof's function to read config
 auto readConfigFile(std::ifstream &input)
 {
@@ -90,16 +102,37 @@ auto readConfigFile(std::ifstream &input)
     return std::make_tuple(vortices, isMobile, cartesianGrid, cloudOfPoints);
 }
 
+void calcRecvcount(int *recvcounts, int numberOfPoints, int nranks)
+{
+    recvcounts[0] = 0;
+    int sum = 2 * numberOfPoints / (nranks - 1);
+    for (int i = 1; i < nranks; i++)
+    {
+        recvcounts[i] = sum;
+    }
+}
+
+void calcDispls(int *displs, int numberOfPoints, int nranks)
+{
+    displs[0] = 0;
+    displs[1] = 0;
+    int sum = 2 * numberOfPoints / (nranks - 1);
+    for (int i = 2; i < nranks; i++)
+    {
+        displs[i] = displs[i - 1] + sum;
+    }
+}
+
 int main(int nargs, char *argv[])
 {
 
     // number of process and process number
-    int nb_process, num_proc;
+    int n_ranks, my_rank;
 
     // initializing MPI
     MPI_Init(&nargs, &argv);
-    MPI_Comm_size(MPI_COMM_WORLD, &nb_process);
-    MPI_Comm_rank(MPI_COMM_WORLD, &num_proc);
+    MPI_Comm_size(MPI_COMM_WORLD, &n_ranks);
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
     // check if has arguments for configuration
     char const *filename;
@@ -130,15 +163,16 @@ int main(int nargs, char *argv[])
 
     grid.updateVelocityField(vortices);
 
-    bool animate = false;
+    bool animate = true;
 
     double dt = 0.1; // velocity
 
     MPI_Status status; // mpi_status for MPI_Iprobe
     MPI_Request request;
-    int flag = 0; // flag to use if there is any message to receive
+    int flag = 0;           // flag to use if there is any message to receive
+    int terminate_flag = 0; // flag to use only if want to terminate processes
 
-    if (num_proc == 0)
+    if (my_rank == 0)
     {
         // screen info
         Graphisme::Screen myScreen({resx, resy}, {grid.getLeftBottomVertex(), grid.getRightTopVertex()});
@@ -151,123 +185,133 @@ int main(int nargs, char *argv[])
         std::cout << "Press up cursor to double the time step" << std::endl;
 
         // initializing variable to hold keyboard's commands
-        char key = '_';
+        char action = NO_ACTION;
         auto start = std::chrono::system_clock::now();
         int frames = 0;
         int fps = 0;
+        int countExited = 0;
 
-        // myScreen.clear(sf::Color::Black);
-        // myScreen.displayVelocityField(grid, vortices);
-        // myScreen.displayParticles(grid, vortices, cloud);
-        // myScreen.display();
+        int cloudRecvcounts[n_ranks];
+        int gridRecvcounts[n_ranks];
+        int cloudDispls[n_ranks];
+        int gridDispls[n_ranks];
 
+        calcRecvcount(cloudRecvcounts, cloud.numberOfPoints(), n_ranks);
+        calcRecvcount(gridRecvcounts, grid.numberOfPoints(), n_ranks);
+        calcDispls(cloudDispls, cloud.numberOfPoints(), n_ranks);
+        calcDispls(gridDispls, grid.numberOfPoints(), n_ranks);
+
+        auto timeoutFinalize = std::chrono::system_clock::now();
         while (myScreen.isOpen())
         {
+            MPI_Iprobe(1, TAG_DATA, MPI_COMM_WORLD, &flag, &status);
+            if (flag)
+            {
+                MPI_Recv(vortices.data(), vortices.numberOfVortices() * 3, MPI_DOUBLE, 1, TAG_DATA, MPI_COMM_WORLD, &status);
+
+                MPI_Gatherv(NULL, 0, MPI_DOUBLE, cloud.data(), cloudRecvcounts, cloudDispls, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+                MPI_Gatherv(NULL, 0, MPI_DOUBLE, grid.data(), gridRecvcounts, gridDispls, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            }
+
+            if (flag)
+            {
+                frames++;
+
+                // updating screen
+                myScreen.clear(sf::Color::Black);
+
+                std::string strDt = std::string("Time step : ") + std::to_string(dt);
+                myScreen.drawText(strDt, Geometry::Point<double>{50, double(myScreen.getGeometry().second - 96)});
+                myScreen.displayVelocityField(grid, vortices);
+                myScreen.displayParticles(grid, vortices, cloud);
+
+                auto end = std::chrono::system_clock::now();
+                std::chrono::duration<double> diff = end - start;
+                if (diff.count() >= 1.0)
+                {
+                    fps = frames;
+                    start = end;
+                    frames = 0;
+                }
+                std::string str_fps = std::string("FPS : ") + std::to_string(fps);
+                myScreen.drawText(str_fps, Geometry::Point<double>{300, double(myScreen.getGeometry().second - 96)});
+                myScreen.display();
+            }
+
             // on inspecte tous les évènements de la fenêtre qui ont été émis depuis la précédente itération
             sf::Event event;
-
-            while (myScreen.pollEvent(event))
+            // while inspecting screen and the command is not T (terminate other processes) or X (terminate this process)
+            while (myScreen.pollEvent(event) && action != ACTION_EXIT)
             {
                 // event resize screen
                 if (event.type == sf::Event::Resized)
                     myScreen.resize(event);
                 // event play animation
                 if (sf::Keyboard::isKeyPressed(sf::Keyboard::P))
-                    key = 'P';
+                    action = ACTION_PLAY;
                 // event stop animation
                 if (sf::Keyboard::isKeyPressed(sf::Keyboard::S))
-                    key = 'S';
+                    action = ACTION_STOP;
                 // event +speed animation
                 if (sf::Keyboard::isKeyPressed(sf::Keyboard::Up))
-                    key = 'U';
+                    action = ACTION_DOUBLE;
                 // event -speed animatin
                 if (sf::Keyboard::isKeyPressed(sf::Keyboard::Down))
-                    key = 'D';
+                    action = ACTION_HALF;
                 // event advance
                 if (sf::Keyboard::isKeyPressed(sf::Keyboard::Right))
-                    key = 'R';
+                    action = ACTION_STEP;
                 // event close window and terminate other processes
                 if (event.type == sf::Event::Closed)
-                    key = 'X';
+                    action = ACTION_EXIT;
                 // if a key is pressed, send this key to process 1
-                if (key != '_')
-                    MPI_Send(&key, 1, MPI_CHAR, 1, 0, MPI_COMM_WORLD);
-
-                if (key == 'X')
+                if (action != NO_ACTION)
                 {
-                    myScreen.close();
-                    MPI_Finalize();
-                    return EXIT_SUCCESS;
+                    for (int i = 1; i < n_ranks; i++)
+                        MPI_Send(&action, 1, MPI_CHAR, i, TAG_USER_ACTION, MPI_COMM_WORLD);
                 }
-
-                key = '_';
+                if (action == ACTION_EXIT)
+                    timeoutFinalize = std::chrono::system_clock::now();
             }
 
-            // checking if there are message to receive
-            MPI_Iprobe(1, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
-            if (flag)
+            auto now = std::chrono::system_clock::now();
+            std::chrono::duration<double> diff = now - timeoutFinalize;
+            if (action == ACTION_EXIT && diff.count() > (0.05 * n_ranks))
             {
-                // receiving calculated data
-                MPI_Irecv(cloud.data(), 2 * cloud.numberOfPoints(), MPI_DOUBLE, 1, 1, MPI_COMM_WORLD, &request);
-                MPI_Irecv(grid.data(), 2 * grid.get_size_velocity_field(), MPI_DOUBLE, 1, 2, MPI_COMM_WORLD, &request);
-                MPI_Irecv(vortices.data(), 3 * vortices.numberOfVortices(), MPI_DOUBLE, 1, 3, MPI_COMM_WORLD, &request);
-                frames++;
+                myScreen.close();
             }
-
-            // updating screen
-            myScreen.clear(sf::Color::Black);
-
-            std::string strDt = std::string("Time step : ") + std::to_string(dt);
-            myScreen.drawText(strDt, Geometry::Point<double>{50, double(myScreen.getGeometry().second - 96)});
-            myScreen.displayVelocityField(grid, vortices);
-            myScreen.displayParticles(grid, vortices, cloud);
-
-            auto end = std::chrono::system_clock::now();
-            std::chrono::duration<double> diff = end - start;
-            if (diff.count() >= 1.0)
-            {
-                fps = frames;
-                start = end;
-                frames = 0;
-            }
-            std::string str_fps = std::string("FPS : ") + std::to_string(fps);
-            myScreen.drawText(str_fps, Geometry::Point<double>{300, double(myScreen.getGeometry().second - 96)});
-            myScreen.display();
         }
     }
-
     else
     {
-        while (true)
+        char action = NO_ACTION;
+        while (action != ACTION_EXIT)
         {
             bool advance = false;
-            char key = '_';
             // checking if process 0 has sent messages
-            MPI_Iprobe(0, 0, MPI_COMM_WORLD, &flag, &status);
+            MPI_Iprobe(0, TAG_USER_ACTION, MPI_COMM_WORLD, &flag, &status);
             if (flag)
             {
                 // reading keyboard pressed
-                MPI_Recv(&key, 1, MPI_CHAR, 0, 0, MPI_COMM_WORLD, &status);
-                switch (key)
+                MPI_Recv(&action, 1, MPI_CHAR, 0, TAG_USER_ACTION, MPI_COMM_WORLD, &status);
+                switch (action)
                 {
-                case 'X':
-                { // terminate processes
-                    MPI_Finalize();
-                    return EXIT_SUCCESS;
-                }
-                case 'P': // play
+                case ACTION_EXIT:
+                    break;
+                case ACTION_PLAY: // play
                     animate = true;
                     break;
-                case 'S': // stop
+                case ACTION_STOP: // stop
                     animate = false;
                     break;
-                case 'U': //+speed
+                case ACTION_DOUBLE: //+speed
                     dt *= 2;
                     break;
-                case 'D': //-speed
+                case ACTION_HALF: //-speed
                     dt /= 2;
                     break;
-                case 'R': // advance
+                case ACTION_STEP: // advance
                     advance = true;
                     break;
                 default:
@@ -276,27 +320,36 @@ int main(int nargs, char *argv[])
             }
 
             // if not stopped, calculate
-            if (animate | advance)
+            if (action != ACTION_EXIT && (animate | advance))
             {
                 if (isMobile)
                 {
-                    cloud = Numeric::solve_RK4_movable_vortices(dt, grid, vortices, cloud);
+                    cloud = Numeric::solve_RK4_movable_vortices(dt, grid, vortices, cloud, my_rank - 1, n_ranks - 1);
                 }
                 else
                 {
-                    cloud = Numeric::solve_RK4_fixed_vortices(dt, grid, cloud);
+                    cloud = Numeric::solve_RK4_fixed_vortices(dt, grid, cloud, my_rank - 1, n_ranks - 1);
                 }
 
                 // sending data to 0 (affichage)
                 // multiply *2 because Geometry::Vector<double> espected in grid is 2D
-                std::cout << "ainda chegou aqui" << std::endl;
-                MPI_Isend(cloud.data(), 2 * cloud.numberOfPoints(), MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, &request);
-                MPI_Isend(grid.data(), 2 * grid.get_size_velocity_field(), MPI_DOUBLE, 0, 2, MPI_COMM_WORLD, &request);
-                MPI_Isend(vortices.data(), 3 * vortices.numberOfVortices(), MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, &request);
+                if (my_rank == 1)
+                    MPI_Send(vortices.data(), vortices.numberOfVortices() * 3, MPI_DOUBLE, 0, TAG_DATA, MPI_COMM_WORLD);
+
+                auto cloudData = cloud.data();
+                auto cloudNumberOfPoints = cloud.numberOfPoints() / (n_ranks - 1);
+                auto cloudPos = (2 * cloudNumberOfPoints) * (my_rank - 1);
+                MPI_Gatherv(&cloudData[cloudPos], 2 * cloudNumberOfPoints, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+                auto gridData = grid.data();
+                auto gridNumberOfPoints = grid.numberOfPoints() / (n_ranks - 1);
+                auto gridPos = (2 * gridNumberOfPoints) * (my_rank - 1);
+                MPI_Gatherv(&gridData[gridPos], 2 * gridNumberOfPoints, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
             }
         }
     }
 
-    // MPI_Finalize();
-    return EXIT_SUCCESS;
+    std::cout << "finalizando " << my_rank << std::endl;
+    MPI_Finalize();
+    return 0;
 }
